@@ -75,6 +75,30 @@ int opt_info_fd = -1;
 int opt_seccomp_fd = -1;
 char *opt_sandbox_hostname = NULL;
 
+#define CAP_TO_MASK_0(x) (1L << ((x) & 31))
+#define CAP_TO_MASK_1(x) CAP_TO_MASK_0(x - 32)
+
+#define ALLOWED_CAPS0_UNSHARE_USER (CAP_TO_MASK_0 (CAP_CHOWN) | CAP_TO_MASK_0(CAP_SETUID) | CAP_TO_MASK_0 (CAP_SETGID) | \
+                                    CAP_TO_MASK_0 (CAP_FOWNER) | CAP_TO_MASK_0 (CAP_DAC_OVERRIDE) | CAP_TO_MASK_0 (CAP_FSETID) | \
+                                    CAP_TO_MASK_0 (CAP_SYS_ADMIN) | CAP_TO_MASK_0 (CAP_SETFCAP))
+#define ALLOWED_CAPS1_UNSHARE_USER (0)
+
+#define ALLOWED_CAPS0_UNSHARE_PID (CAP_TO_MASK_0 (CAP_KILL) | CAP_TO_MASK_0 (CAP_SETPCAP))
+#define ALLOWED_CAPS1_UNSHARE_PID (0)
+
+#define ALLOWED_CAPS0_UNSHARE_NET (CAP_TO_MASK_0 (CAP_NET_BIND_SERVICE) | CAP_TO_MASK_0 (CAP_NET_RAW) | \
+                                   CAP_TO_MASK_0 (CAP_NET_BROADCAST))
+#define ALLOWED_CAPS1_UNSHARE_NET (0)
+
+#define ALLOWED_CAPS0 (ALLOWED_CAPS0_UNSHARE_USER | ALLOWED_CAPS0_UNSHARE_PID | ALLOWED_CAPS0_UNSHARE_NET)
+#define ALLOWED_CAPS1 (ALLOWED_CAPS1_UNSHARE_USER | ALLOWED_CAPS1_UNSHARE_PID | ALLOWED_CAPS1_UNSHARE_NET)
+
+static uint32_t requested_caps[2] = {0, 0};
+
+/* low 32bit caps needed */
+#define REQUIRED_SETUP_CAPS_0 (ALLOWED_CAPS0 | CAP_TO_MASK_0 (CAP_SYS_CHROOT) | CAP_TO_MASK_0 (CAP_NET_ADMIN))
+#define REQUIRED_SETUP_CAPS_1 (ALLOWED_CAPS1)
+
 typedef enum {
   SETUP_BIND_MOUNT,
   SETUP_RO_BIND_MOUNT,
@@ -221,6 +245,8 @@ usage (int ecode, FILE *out)
            "    --new-session                Create a new terminal session\n"
            "    --die-with-parent            Kills with SIGKILL child process (COMMAND) when bwrap or bwrap's parent dies.\n"
            "    --as-pid-1                   Do not install a reaper process with PID=1\n"
+           "    --cap-add CAP                Add cap CAP when running as privileged user\n"
+           "    --cap-drop CAP               Drop cap CAP when running as privileged user\n"
           );
   exit (ecode);
 }
@@ -450,33 +476,70 @@ do_init (int event_fd, pid_t initial_pid, struct sock_fprog *seccomp_prog)
   return initial_exit_status;
 }
 
-/* low 32bit caps needed */
-#define REQUIRED_CAPS_0 (CAP_TO_MASK (CAP_SYS_ADMIN) | CAP_TO_MASK (CAP_SYS_CHROOT) | CAP_TO_MASK (CAP_NET_ADMIN) | CAP_TO_MASK (CAP_SETUID) | CAP_TO_MASK (CAP_SETGID))
-/* high 32bit caps needed */
-#define REQUIRED_CAPS_1 0
-
 static void
-set_required_caps (void)
+set_required_caps (bool setup)
 {
   struct __user_cap_header_struct hdr = { _LINUX_CAPABILITY_VERSION_3, 0 };
   struct __user_cap_data_struct data[2] = { { 0 } };
 
   /* Drop all non-require capabilities */
-  data[0].effective = REQUIRED_CAPS_0;
-  data[0].permitted = REQUIRED_CAPS_0;
-  data[0].inheritable = 0;
-  data[1].effective = REQUIRED_CAPS_1;
-  data[1].permitted = REQUIRED_CAPS_1;
-  data[1].inheritable = 0;
+  data[0].effective = REQUIRED_SETUP_CAPS_0;
+  data[0].permitted = REQUIRED_SETUP_CAPS_0;
+  data[0].inheritable = setup ? 0 : requested_caps[0];
+  data[1].effective = REQUIRED_SETUP_CAPS_1;
+  data[1].permitted = REQUIRED_SETUP_CAPS_1;
+  data[1].inheritable = setup ? 0 : requested_caps[1];
   if (capset (&hdr, data) < 0)
     die_with_error ("capset failed");
 }
 
 static void
-drop_all_caps (void)
+drop_caps (bool drop_all)
 {
   struct __user_cap_header_struct hdr = { _LINUX_CAPABILITY_VERSION_3, 0 };
   struct __user_cap_data_struct data[2] = { { 0 } };
+  uint32_t caps0 = 0;
+  uint32_t caps1 = 0;
+  /* First collect all the allowed caps, then drop those not requested.  */
+  if (drop_all)
+    {
+      caps0 = caps1 = 0;
+    }
+  else
+    {
+      caps0 = CAP_TO_MASK_0 (CAP_SYS_CHROOT);
+      if (opt_unshare_user)
+        {
+          caps0 |= ALLOWED_CAPS0_UNSHARE_USER;
+          caps1 |= ALLOWED_CAPS1_UNSHARE_USER;
+        }
+
+      if (opt_unshare_pid)
+        {
+          caps0 |= ALLOWED_CAPS0_UNSHARE_PID;
+          caps1 |= ALLOWED_CAPS1_UNSHARE_PID;
+        }
+
+      if (opt_unshare_net)
+        {
+          caps0 |= ALLOWED_CAPS0_UNSHARE_NET;
+          caps1 |= ALLOWED_CAPS1_UNSHARE_NET;
+        }
+
+      if ((requested_caps[0] & ~caps0) ||
+          (requested_caps[1] & ~caps1))
+        die ("invalid caps requested, you may need to specify some of --unshare-net, --unshare-pid or --unshare-user");
+
+      caps0 &= requested_caps[0];
+      caps1 &= requested_caps[1];
+    }
+
+  data[0].effective = caps0;
+  data[0].permitted = caps0;
+  data[0].inheritable = caps0;
+  data[1].effective = caps1;
+  data[1].permitted = caps1;
+  data[1].inheritable = caps1;
 
   if (capset (&hdr, data) < 0)
     die_with_error ("capset failed");
@@ -506,11 +569,25 @@ drop_cap_bounding_set (void)
    *  https://github.com/projectatomic/bubblewrap/pull/175#issuecomment-278051373
    *  https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/security/commoncap.c?id=160da84dbb39443fdade7151bc63a88f8e953077
    */
-  for (cap = 0; cap <= 63; cap++)
+  for (cap = 0; cap <= CAP_LAST_CAP; cap++)
     {
-      int res = prctl (PR_CAPBSET_DROP, cap, 0, 0, 0);
-      if (res == -1 && !(errno == EINVAL || errno == EPERM))
-        die_with_error ("Dropping capability %ld from bounds", cap);
+      bool keep = FALSE;
+      if (cap < 32)
+        {
+          if (CAP_TO_MASK_0 (cap) & requested_caps[0])
+            keep = TRUE;
+        }
+      else
+        {
+          if (CAP_TO_MASK_1 (cap) & requested_caps[1])
+            keep = TRUE;
+        }
+      if (!keep)
+        {
+          int res = prctl (PR_CAPBSET_DROP, cap, 0, 0, 0);
+          if (res == -1 && !(errno == EINVAL || errno == EPERM))
+            die_with_error ("Dropping capability %ld from bounds", cap);
+        }
     }
 }
 
@@ -566,7 +643,7 @@ acquire_privs (void)
       drop_cap_bounding_set ();
 
       /* Keep only the required capabilities for setup */
-      set_required_caps ();
+      set_required_caps (TRUE);
     }
   else if (real_uid != 0 && has_caps ())
     {
@@ -598,11 +675,11 @@ switch_to_user_with_privs (void)
     die_with_error ("unable to drop root uid");
 
   /* Regain effective required capabilities from permitted */
-  set_required_caps ();
+  set_required_caps (FALSE);
 }
 
 static void
-drop_privs (void)
+drop_privs (bool drop_all)
 {
   if (!is_privileged)
     return;
@@ -611,7 +688,7 @@ drop_privs (void)
   if (setuid (opt_sandbox_uid) < 0)
     die_with_error ("unable to drop root uid");
 
-  drop_all_caps ();
+  drop_caps (drop_all);
 }
 
 static char *
@@ -1658,6 +1735,55 @@ parse_args_recurse (int    *argcp,
         {
           opt_as_pid_1 = TRUE;
         }
+      else if (strcmp (arg, "--cap-add") == 0)
+        {
+          cap_value_t cap;
+          if (argc < 2)
+            die ("--cap takes an argument");
+
+          if (strcasecmp (argv[1], "ALL") == 0)
+            {
+              requested_caps[0] = ALLOWED_CAPS0;
+              requested_caps[1] = ALLOWED_CAPS1;
+            }
+          else
+            {
+              if (cap_from_name (argv[1], &cap) < 0)
+                die ("unknown cap: %s", argv[1]);
+
+              if (cap < 32)
+                requested_caps[0] |= CAP_TO_MASK_0 (cap);
+              else
+                requested_caps[1] |= CAP_TO_MASK_0 (cap - 32);
+            }
+
+          argv += 1;
+          argc -= 1;
+        }
+      else if (strcmp (arg, "--cap-drop") == 0)
+        {
+          cap_value_t cap;
+          if (argc < 2)
+            die ("--cap takes an argument");
+
+          if (strcasecmp (argv[1], "ALL") == 0)
+            {
+              requested_caps[0] = requested_caps[1] = 0;
+            }
+          else
+            {
+              if (cap_from_name (argv[1], &cap) < 0)
+                die ("unknown cap: %s", argv[1]);
+
+              if (cap < 32)
+                requested_caps[0] &= ~CAP_TO_MASK_0 (cap);
+              else
+                requested_caps[1] &= ~CAP_TO_MASK_0 (cap - 32);
+            }
+
+          argv += 1;
+          argc -= 1;
+        }
       else if (*arg == '-')
         {
           die ("Unknown option %s", arg);
@@ -1763,6 +1889,9 @@ main (int    argc,
     usage (EXIT_FAILURE, stderr);
 
   parse_args (&argc, &argv);
+
+  if ((requested_caps[0] || requested_caps[1]) && is_privileged && getuid () != 0)
+    die_with_error ("--cap-add in privileged mode can be used only by root");
 
   /* We have to do this if we weren't installed setuid (and we're not
    * root), so let's just DWIM */
@@ -1920,7 +2049,7 @@ main (int    argc,
       /* Initial launched process, wait for exec:ed command to exit */
 
       /* We don't need any privileges in the launcher, drop them immediately. */
-      drop_privs ();
+      drop_privs (TRUE);
 
       /* Optionally bind our lifecycle to that of the parent */
       handle_die_with_parent ();
@@ -2050,7 +2179,7 @@ main (int    argc,
       if (child == 0)
         {
           /* Unprivileged setup process */
-          drop_privs ();
+          drop_privs (TRUE);
           close (privsep_sockets[0]);
           setup_newroot (opt_unshare_pid, privsep_sockets[1]);
           exit (0);
@@ -2115,8 +2244,8 @@ main (int    argc,
   if (chdir ("/") != 0)
     die_with_error ("chdir /");
 
-  /* All privileged ops are done now, so drop it */
-  drop_privs ();
+  /* All privileged ops are done now, so drop caps we don't need */
+  drop_privs (FALSE);
 
   if (opt_block_fd != -1)
     {

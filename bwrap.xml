@@ -295,6 +295,28 @@
 	Do not create a process with PID=1 in the sandbox to reap child processes.
       </para></listitem>
     </varlistentry>
+    <varlistentry>
+      <term><option>--cap-add <arg choice="plain">CAP</arg></option></term>
+      <listitem><para>
+        Add the specified capability when running as privileged user.  It accepts
+        the special value ALL to add all the permitted caps.
+
+        CAP_SYS_ADMIN, CAP_CHOWN, CAP_SETUID, CAP_SETGID, CAP_FOWNER,
+        CAP_DAC_OVERRIDE, CAP_FSETID, CAP_SETFCAP require
+        --unshare-user.
+
+        CAP_KILL and CAP_SETPCAP require --unshare-pid.
+
+        CAP_NET_BIND_SERVICE, CAP_NET_RAW, CAP_NET_BROADCAST require --unshare-net.
+      </para></listitem>
+    </varlistentry>
+    <varlistentry>
+      <term><option>--cap-drop <arg choice="plain">CAP</arg></option></term>
+      <listitem><para>
+        Drop the specified capability when running as privileged user.  It accepts
+        the special value ALL to drop all the caps.
+      </para></listitem>
+    </varlistentry>
   </variablelist>
 </refsect1>
 
