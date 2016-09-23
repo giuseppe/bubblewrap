@@ -75,6 +75,16 @@ int opt_info_fd = -1;
 int opt_seccomp_fd = -1;
 char *opt_sandbox_hostname = NULL;
 
+#define CAP_TO_MASK_0(x) (1L << ((x) & 31))
+#define CAP_TO_MASK_1(x) CAP_TO_MASK_0(x - 32)
+
+static uint32_t requested_caps[2] = {0, 0};
+
+/* low 32bit caps needed */
+#define REQUIRED_CAPS_0 (CAP_TO_MASK_0 (CAP_SYS_ADMIN) | CAP_TO_MASK_0 (CAP_SYS_CHROOT) | CAP_TO_MASK_0 (CAP_NET_ADMIN) | CAP_TO_MASK_0 (CAP_SETUID) | CAP_TO_MASK_0 (CAP_SETGID))
+/* high 32bit caps needed */
+#define REQUIRED_CAPS_1 0
+
 typedef enum {
   SETUP_BIND_MOUNT,
   SETUP_RO_BIND_MOUNT,
@@ -221,6 +231,8 @@ usage (int ecode, FILE *out)
            "    --new-session                Create a new terminal session\n"
            "    --die-with-parent            Kills with SIGKILL child process (COMMAND) when bwrap or bwrap's parent dies.\n"
            "    --as-pid-1                   Do not install a reaper process with PID=1\n"
+           "    --cap-add CAP                Add cap CAP when running as privileged user\n"
+           "    --cap-drop CAP               Drop cap CAP when running as privileged user\n"
           );
   exit (ecode);
 }
@@ -450,13 +462,8 @@ do_init (int event_fd, pid_t initial_pid, struct sock_fprog *seccomp_prog)
   return initial_exit_status;
 }
 
-/* low 32bit caps needed */
-#define REQUIRED_CAPS_0 (CAP_TO_MASK (CAP_SYS_ADMIN) | CAP_TO_MASK (CAP_SYS_CHROOT) | CAP_TO_MASK (CAP_NET_ADMIN) | CAP_TO_MASK (CAP_SETUID) | CAP_TO_MASK (CAP_SETGID))
-/* high 32bit caps needed */
-#define REQUIRED_CAPS_1 0
-
 static void
-set_required_caps (void)
+set_required_caps (bool setup)
 {
   struct __user_cap_header_struct hdr = { _LINUX_CAPABILITY_VERSION_3, 0 };
   struct __user_cap_data_struct data[2] = { { 0 } };
@@ -506,11 +513,25 @@ drop_cap_bounding_set (void)
    *  https://github.com/projectatomic/bubblewrap/pull/175#issuecomment-278051373
    *  https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/security/commoncap.c?id=160da84dbb39443fdade7151bc63a88f8e953077
    */
-  for (cap = 0; cap <= 63; cap++)
+  for (cap = 0; cap <= CAP_LAST_CAP; cap++)
     {
-      int res = prctl (PR_CAPBSET_DROP, cap, 0, 0, 0);
-      if (res == -1 && !(errno == EINVAL || errno == EPERM))
-        die_with_error ("Dropping capability %ld from bounds", cap);
+      bool keep = FALSE;
+      if (cap < 32)
+        {
+          if (CAP_TO_MASK_0 (cap) & requested_caps[0])
+            keep = TRUE;
+        }
+      else
+        {
+          if (CAP_TO_MASK_1 (cap) & requested_caps[1])
+            keep = TRUE;
+        }
+      if (!keep)
+        {
+          int res = prctl (PR_CAPBSET_DROP, cap, 0, 0, 0);
+          if (res == -1 && !(errno == EINVAL || errno == EPERM))
+            die_with_error ("Dropping capability %ld from bounds", cap);
+        }
     }
 }
 
@@ -566,7 +587,7 @@ acquire_privs (void)
       drop_cap_bounding_set ();
 
       /* Keep only the required capabilities for setup */
-      set_required_caps ();
+      set_required_caps (TRUE);
     }
   else if (real_uid != 0 && has_caps ())
     {
@@ -598,7 +619,7 @@ switch_to_user_with_privs (void)
     die_with_error ("unable to drop root uid");
 
   /* Regain effective required capabilities from permitted */
-  set_required_caps ();
+  set_required_caps (FALSE);
 }
 
 static void
@@ -1658,6 +1679,54 @@ parse_args_recurse (int    *argcp,
         {
           opt_as_pid_1 = TRUE;
         }
+      else if (strcmp (arg, "--cap-add") == 0)
+        {
+          cap_value_t cap;
+          if (argc < 2)
+            die ("--cap-add takes an argument");
+
+          if (strcasecmp (argv[1], "ALL") == 0)
+            {
+              requested_caps[0] = requested_caps[1] = 0xFFFFFFFF;
+            }
+          else
+            {
+              if (cap_from_name (argv[1], &cap) < 0)
+                die ("unknown cap: %s", argv[1]);
+
+              if (cap < 32)
+                requested_caps[0] |= CAP_TO_MASK_0 (cap);
+              else
+                requested_caps[1] |= CAP_TO_MASK_1 (cap - 32);
+            }
+
+          argv += 1;
+          argc -= 1;
+        }
+      else if (strcmp (arg, "--cap-drop") == 0)
+        {
+          cap_value_t cap;
+          if (argc < 2)
+            die ("--cap-drop takes an argument");
+
+          if (strcasecmp (argv[1], "ALL") == 0)
+            {
+              requested_caps[0] = requested_caps[1] = 0;
+            }
+          else
+            {
+              if (cap_from_name (argv[1], &cap) < 0)
+                die ("unknown cap: %s", argv[1]);
+
+              if (cap < 32)
+                requested_caps[0] &= ~CAP_TO_MASK_0 (cap);
+              else
+                requested_caps[1] &= ~CAP_TO_MASK_1 (cap - 32);
+            }
+
+          argv += 1;
+          argc -= 1;
+        }
       else if (*arg == '-')
         {
           die ("Unknown option %s", arg);
@@ -1763,6 +1832,9 @@ main (int    argc,
     usage (EXIT_FAILURE, stderr);
 
   parse_args (&argc, &argv);
+
+  if ((requested_caps[0] || requested_caps[1]) && is_privileged)
+    die_with_error ("--cap-add in setuid mode can be used only by root");
 
   /* We have to do this if we weren't installed setuid (and we're not
    * root), so let's just DWIM */
@@ -2115,7 +2187,7 @@ main (int    argc,
   if (chdir ("/") != 0)
     die_with_error ("chdir /");
 
-  /* All privileged ops are done now, so drop it */
+  /* All privileged ops are done now, so drop caps we don't need */
   drop_privs ();
 
   if (opt_block_fd != -1)

@@ -70,13 +70,17 @@ for ALT in "" "--unshare-user-try"  "--unshare-pid" "--unshare-user-try --unshar
     $RUN $ALT --unshare-net --proc /proc --dev /dev true
     # Unreadable file
     echo -n "expect EPERM: "
-    if $RUN $ALT --unshare-net --proc /proc --bind /etc/shadow  /tmp/foo cat /etc/shadow; then
-        assert_not_reached Could read /etc/shadow
+
+    # Test caps when bwrap is not setuid
+    if ! test -u ${BWRAP}; then
+        if $RUN $ALT --cap-add ALL $ALT --unshare-net --proc /proc --bind /etc/shadow  /tmp/foo cat /etc/shadow; then
+            assert_not_reached Could read /etc/shadow
+        fi
     fi
     # Unreadable dir
     if [ x$UNREADABLE != x ]; then
         echo -n "expect EPERM: "
-        if $RUN $ALT --unshare-net --proc /proc --dev /dev --bind $UNREADABLE  /tmp/foo cat /tmp/foo ; then
+        if $RUN $ALT --cap-add ALL $ALT --unshare-net --proc /proc --dev /dev --bind $UNREADABLE  /tmp/foo cat /tmp/foo ; then
             assert_not_reached Could read $UNREADABLE
         fi
     fi
