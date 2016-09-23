@@ -53,6 +53,7 @@ static const char *host_tty_dev;
 static int proc_fd = -1;
 static char *opt_exec_label = NULL;
 static char *opt_file_label = NULL;
+static bool no_reaper;
 
 char *opt_chdir_path = NULL;
 bool opt_unshare_user = FALSE;
@@ -219,6 +220,7 @@ usage (int ecode, FILE *out)
            "    --info-fd FD                 Write information about the running container to FD\n"
            "    --new-session                Create a new terminal session\n"
            "    --die-with-parent            Kills with SIGKILL child process (COMMAND) when bwrap or bwrap's parent dies.\n"
+           "    --no-reaper                  Do not install a reaper process with PID=1\n"
           );
   exit (ecode);
 }
@@ -1652,6 +1654,10 @@ parse_args_recurse (int    *argcp,
         {
           opt_die_with_parent = TRUE;
         }
+      else if (strcmp (arg, "--no-reaper") == 0)
+        {
+          no_reaper = TRUE;
+        }
       else if (*arg == '-')
         {
           die ("Unknown option %s", arg);
@@ -2162,7 +2168,7 @@ main (int    argc,
 
   __debug__ (("forking for child\n"));
 
-  if (opt_unshare_pid || lock_files != NULL || opt_sync_fd != -1)
+  if (!no_reaper && (opt_unshare_pid || lock_files != NULL || opt_sync_fd != -1))
     {
       /* We have to have a pid 1 in the pid namespace, because
        * otherwise we'll get a bunch of zombies as nothing reaps
@@ -2201,8 +2207,11 @@ main (int    argc,
   if (proc_fd != -1)
     close (proc_fd);
 
-  if (opt_sync_fd != -1)
-    close (opt_sync_fd);
+  if (!no_reaper)
+    {
+      if (opt_sync_fd != -1)
+        close (opt_sync_fd);
+    }
 
   /* We want sigchild in the child */
   unblock_sigchild ();

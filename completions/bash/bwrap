@@ -18,6 +18,7 @@ _bwrap() {
 		--unshare-pid
 		--unshare-uts
 		--version
+                --no-reaper
 	"
 
 	local options_with_args="
