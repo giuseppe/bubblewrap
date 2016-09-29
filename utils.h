@@ -29,6 +29,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <stdint.h>
 
 #if 0
 #define __debug__(x) printf x
@@ -106,6 +107,11 @@ int   mkdir_with_parents (const char *pathname,
                           int         mode,
                           bool        create_last);
 
+int getsubidrange (uid_t id,
+                   bool is_uid,
+                   uint32_t *from,
+                   uint32_t *len);
+
 /* syscall wrappers */
 int   raw_clone (unsigned long flags,
                  void         *child_stack);
@@ -145,9 +151,18 @@ cleanup_fdp (int *fdp)
     (void) close (fd);
 }
 
+static inline void
+cleanup_file (FILE **f)
+{
+  FILE *file = *f;
+  if (file)
+    (void) fclose (file);
+}
+
 #define cleanup_free __attribute__((cleanup (cleanup_freep)))
 #define cleanup_fd __attribute__((cleanup (cleanup_fdp)))
 #define cleanup_strv __attribute__((cleanup (cleanup_strvp)))
+#define cleanup_file __attribute__((cleanup (cleanup_file)))
 
 static inline void *
 steal_pointer (void *pp)

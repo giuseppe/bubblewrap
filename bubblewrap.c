@@ -77,6 +77,7 @@ char *opt_sandbox_hostname = NULL;
 
 #define CAP_TO_MASK_0(x) (1L << ((x) & 31))
 #define CAP_TO_MASK_1(x) CAP_TO_MASK_0(x - 32)
+#define min(a, b) (((a) < (b)) ? (a) : (b))
 
 static uint32_t requested_caps[2] = {0, 0};
 
@@ -126,6 +127,15 @@ struct _LockFile
   LockFile   *next;
 };
 
+struct _IdMapping
+{
+  int id;
+  int lowerid;
+  int count;
+};
+
+typedef struct _IdMapping IdMapping;
+
 static SetupOp *ops = NULL;
 static SetupOp *last_op = NULL;
 static LockFile *lock_files = NULL;
@@ -149,6 +159,14 @@ typedef struct
   uint32_t arg1_offset;
   uint32_t arg2_offset;
 } PrivSepOp;
+
+static void
+make_mapping (IdMapping *mapping, int id, int lowerid, int count)
+{
+  mapping->id = id;
+  mapping->lowerid = lowerid;
+  mapping->count = count;
+}
 
 static SetupOp *
 setup_op_new (SetupOpType type)
@@ -651,7 +669,126 @@ get_oldroot_path (const char *path)
   return strconcat ("/oldroot/", path);
 }
 
-static void
+static size_t
+generate_mappings (bool map_root, uid_t sandbox_id, uid_t parent_id, bool is_uid,
+                   IdMapping *mappings, size_t nmappings, bool *found_mapping)
+{
+  uint32_t from_id, len_id_range;
+  size_t ret = 0;
+
+  if (nmappings < 4)
+    return 0;
+
+  *found_mapping = TRUE;
+  if (getsubidrange (parent_id, is_uid, &from_id, &len_id_range) < 0)
+    {
+      from_id = 0;
+      len_id_range = 0;
+      *found_mapping = FALSE;
+    }
+
+  /* Simple case, we map directly the user to whatever id was requested,
+     or we are mapping root and the requested id is 0.  */
+  if (!map_root || sandbox_id == 0)
+    make_mapping (&mappings[ret++], sandbox_id, parent_id, 1);
+  else
+    {
+      int overflow_id;
+
+      /* If we found extra uids/gids set for the user use them
+         instead of the overflow ids.  */
+      if (len_id_range == 0)
+        overflow_id = is_uid ? overflow_uid : overflow_gid;
+      else
+        {
+          overflow_id = from_id;
+          from_id++;
+          len_id_range--;
+        }
+      make_mapping (&mappings[ret++], 0, overflow_id, 1);
+      make_mapping (&mappings[ret++], sandbox_id, parent_id, 1);
+    }
+
+  /* Map remaining ids [map_root ? 1 : 0, sandbox_id) in the sandbox, if any.  */
+  if (sandbox_id > 0)
+    {
+      int len = min (sandbox_id - (map_root ? 1 : 0), len_id_range);
+      if (len)
+        make_mapping (&mappings[ret++], map_root ? 1 : 0, from_id, len);
+      from_id += len;
+      len_id_range -= len;
+    }
+
+  /* If there is any other subid left, use them all for ids > sandbox_id.  */
+  if (len_id_range)
+    make_mapping (&mappings[ret++], sandbox_id + 1, from_id, len_id_range);
+
+  return ret;
+}
+
+static char *
+generate_map_file (IdMapping *mappings, size_t n_mappings)
+{
+  cleanup_strv char **lines = NULL;
+  size_t i, retsize = 0;
+  char *it, *ret = NULL;
+
+  if (n_mappings < 0)
+    return NULL;
+
+  lines = xcalloc (sizeof (char *) * (n_mappings + 1));
+
+  for (i = 0; i < n_mappings; i++)
+    {
+      lines[i] = xasprintf ("%d %d %d\n", mappings[i].id, mappings[i].lowerid,
+                            mappings[i].count);
+      retsize += strlen (lines[i]);
+    }
+
+  ret = xmalloc (retsize + 1);
+  it = ret;
+  for (i = 0; i < n_mappings; i++) {
+      it = stpcpy (it, lines[i]);
+  }
+  ret[retsize] = '\0';
+  return ret;
+}
+
+/* Helper function for calling newuidmap/newgidmap tools.  Set the specified
+   MAPPINGS on the process PID.  */
+static int
+exec_new_mapping_helper (const char *program, int pid, IdMapping *mappings,
+                         size_t n_mappings)
+{
+  cleanup_strv char **args = NULL;
+  size_t i;
+  int child, status;
+
+  args = xcalloc (sizeof (char *) * (3 + n_mappings * 3));
+  args[0] = xstrdup (program);
+  args[1] = xasprintf ("%d", pid);
+  for (i = 0; i < n_mappings; i++)
+    {
+      args[2 + i*3] = xasprintf ("%d", mappings[i].id);
+      args[3 + i*3] = xasprintf ("%d", mappings[i].lowerid);
+      args[4 + i*3] = xasprintf ("%d", mappings[i].count);
+    }
+
+  child = fork ();
+  if (child < 0)
+    die_with_error ("fork mapping helper");
+
+  if (child == 0)
+    {
+      execvp (program, args);
+      exit (EXIT_FAILURE);
+    }
+
+  waitpid (child, &status, 0);
+  return WEXITSTATUS (status);
+}
+
+static bool
 write_uid_gid_map (uid_t sandbox_uid,
                    uid_t parent_uid,
                    uid_t sandbox_gid,
@@ -665,38 +802,65 @@ write_uid_gid_map (uid_t sandbox_uid,
   cleanup_free char *dir = NULL;
   cleanup_fd int dir_fd = -1;
   uid_t old_fsuid = -1;
+  bool found_mapping = FALSE;
+  bool found_mapping_uid = FALSE;
+  bool found_mapping_gid = FALSE;
+  IdMapping uid_mappings[4];
+  IdMapping gid_mappings[4];
+  size_t nmappings_uid;
+  size_t nmappings_gid;
+
+  nmappings_uid = generate_mappings (map_root, sandbox_uid, parent_uid, TRUE,
+                                     uid_mappings, sizeof(uid_mappings),
+                                     &found_mapping_uid);
+  nmappings_gid = generate_mappings (map_root, sandbox_gid, parent_gid, FALSE,
+                                     gid_mappings, sizeof(gid_mappings),
+                                     &found_mapping_gid);
+
+  if (found_mapping_uid != found_mapping_gid)
+    die ("configuration error: a mapping must exist both for uids and gids");
+
+  found_mapping = found_mapping_uid;
+
+  if (!is_privileged)
+    {
+      cleanup_free char *uidmap_cmd = NULL;
+      cleanup_free char *gidmap_cmd = NULL;
+
+      if (pid >= 0 && found_mapping)
+        {
+          if (exec_new_mapping_helper ("newuidmap", pid, uid_mappings,
+                                       nmappings_uid) < 0)
+            die ("newuidmap");
+
+          if (exec_new_mapping_helper ("newgidmap", pid, gid_mappings,
+                                       nmappings_gid) < 0)
+            die ("newgidmap");
+        }
+      if (found_mapping)
+        return found_mapping;
+    }
+
+  /* Do not try to write the map file if is the not privileged case
+     and this function is invoked from the parent process (pid >= 0).*/
+  if (!is_privileged && pid >= 0)
+    return found_mapping;
 
   if (pid == -1)
     dir = xstrdup ("self");
   else
     dir = xasprintf ("%d", pid);
 
-  dir_fd = openat (proc_fd, dir, O_RDONLY | O_PATH);
-  if (dir_fd < 0)
-    die_with_error ("open /proc/%s failed", dir);
-
-  if (map_root && parent_uid != 0 && sandbox_uid != 0)
-    uid_map = xasprintf ("0 %d 1\n"
-                         "%d %d 1\n", overflow_uid, sandbox_uid, parent_uid);
-  else
-    uid_map = xasprintf ("%d %d 1\n", sandbox_uid, parent_uid);
-
-  if (map_root && parent_gid != 0 && sandbox_gid != 0)
-    gid_map = xasprintf ("0 %d 1\n"
-                         "%d %d 1\n", overflow_gid, sandbox_gid, parent_gid);
-  else
-    gid_map = xasprintf ("%d %d 1\n", sandbox_gid, parent_gid);
-
   /* We have to be root to be allowed to write to the uid map
    * for setuid apps, so temporary set fsuid to 0 */
   if (is_privileged)
     old_fsuid = setfsuid (0);
 
-  if (write_file_at (dir_fd, "uid_map", uid_map) != 0)
-    die_with_error ("setting up uid map");
+  dir_fd = openat (proc_fd, dir, O_RDONLY | O_PATH);
+  if (dir_fd < 0)
+    die_with_error ("open /proc/%s failed", dir);
 
-  if (deny_groups &&
-      write_file_at (dir_fd, "setgroups", "deny\n") != 0)
+  if (deny_groups && write_file_at (dir_fd, "setgroups", "deny\n") != 0)
     {
       /* If /proc/[pid]/setgroups does not exist, assume we are
        * running a linux kernel < 3.19, i.e. we live with the
@@ -707,6 +871,12 @@ write_uid_gid_map (uid_t sandbox_uid,
         die_with_error ("error writing to setgroups");
     }
 
+  uid_map = generate_map_file (uid_mappings, nmappings_uid);
+  gid_map = generate_map_file (gid_mappings, nmappings_gid);
+
+  if (write_file_at (dir_fd, "uid_map", uid_map) != 0)
+    die_with_error ("setting up uid map");
+
   if (write_file_at (dir_fd, "gid_map", gid_map) != 0)
     die_with_error ("setting up gid map");
 
@@ -716,6 +886,7 @@ write_uid_gid_map (uid_t sandbox_uid,
       if (setfsuid (-1) != real_uid)
         die ("Unable to re-set fsuid");
     }
+  return found_mapping;
 }
 
 static void
@@ -1796,6 +1967,7 @@ main (int    argc,
   cleanup_free char *seccomp_data = NULL;
   size_t seccomp_len;
   struct sock_fprog seccomp_prog;
+  bool found_mapping = FALSE;
 
   /* Handle --version early on before we try to acquire/drop
    * any capabilities so it works in a build environment;
@@ -1974,20 +2146,10 @@ main (int    argc,
     {
       /* Parent, outside sandbox, privileged (initially) */
 
-      if (is_privileged && opt_unshare_user)
-        {
-          /* We're running as euid 0, but the uid we want to map is
-           * not 0. This means we're not allowed to write this from
-           * the child user namespace, so we do it from the parent.
-           *
-           * Also, we map uid/gid 0 in the namespace (to overflowuid)
-           * if opt_needs_devpts is true, because otherwise the mount
-           * of devpts fails due to root not being mapped.
-           */
-          write_uid_gid_map (ns_uid, real_uid,
-                             ns_gid, real_gid,
-                             pid, TRUE, opt_needs_devpts);
-        }
+      if (opt_unshare_user)
+        write_uid_gid_map (ns_uid, real_uid,
+                           ns_gid, real_gid,
+                           pid, TRUE, opt_needs_devpts);
 
       if (!is_privileged && prctl (PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
         die_with_error ("prctl(PR_SET_NO_NEW_CAPS) failed");
@@ -2069,9 +2231,9 @@ main (int    argc,
           ns_gid = 0;
         }
 
-      write_uid_gid_map (ns_uid, real_uid,
-                         ns_gid, real_gid,
-                         -1, TRUE, FALSE);
+      found_mapping = write_uid_gid_map (ns_uid, real_uid,
+                                         ns_gid, real_gid,
+                                         -1, TRUE, FALSE);
     }
 
   old_umask = umask (0);
@@ -2170,20 +2332,19 @@ main (int    argc,
   if (umount2 ("oldroot", MNT_DETACH))
     die_with_error ("unmount old root");
 
-  if (opt_unshare_user &&
-      (ns_uid != opt_sandbox_uid || ns_gid != opt_sandbox_gid))
+  if (opt_unshare_user && !found_mapping && opt_needs_devpts && (opt_sandbox_uid != 0 || opt_sandbox_gid != 0))
     {
       /* Now that devpts is mounted and we've no need for mount
          permissions we can create a new userspace and map our uid
          1:1 */
-
       if (unshare (CLONE_NEWUSER))
         die_with_error ("unshare user ns");
 
-      write_uid_gid_map (opt_sandbox_uid, ns_uid,
-                         opt_sandbox_gid, ns_gid,
+      write_uid_gid_map (opt_sandbox_uid, 0,
+                         opt_sandbox_gid, 0,
                          -1, FALSE, FALSE);
     }
+
 
   /* Now make /newroot the real root */
   if (chdir ("/newroot") != 0)
