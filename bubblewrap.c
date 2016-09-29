@@ -45,8 +45,6 @@
 /* Globals to avoid having to use getuid(), since the uid/gid changes during runtime */
 static uid_t real_uid;
 static gid_t real_gid;
-static uid_t overflow_uid;
-static gid_t overflow_gid;
 static bool is_privileged;
 static const char *argv0;
 static const char *host_tty_dev;
@@ -707,6 +705,48 @@ get_oldroot_path (const char *path)
   return strconcat ("/oldroot/", path);
 }
 
+static char *
+generate_map_file (bool map_root, uid_t sandbox_id, uid_t parent_id, bool is_uid, char *sep)
+{
+  cleanup_free char *line1 = NULL;
+  cleanup_free char *line2 = NULL;
+  cleanup_free char *line3 = NULL;
+  cleanup_free char *line4 = NULL;
+  uint32_t from_id, len_id_range;
+
+  if (opt_unshare_user && getsubidrange (parent_id, is_uid, &from_id, &len_id_range) < 0)
+    {
+      if (map_root && parent_id != 0 && sandbox_id != 0)
+        return xasprintf ("0 %d 1%s", parent_id, sep);
+      else
+        return xasprintf ("%d %d 1%s", sandbox_id, parent_id, sep);
+    }
+
+  if (map_root && parent_id != 0 && sandbox_id != 0)
+    {
+      line1 = xasprintf ("0 %d 1%s", from_id, sep);
+      from_id++;
+      len_id_range--;
+    }
+  if (opt_unshare_user && len_id_range)
+    {
+      if (sandbox_id > len_id_range)
+        line2 = xasprintf ("%d %d %d%s", map_root ? 1 : 0, from_id, len_id_range, sep);
+      else
+        {
+          int size_first_interval = sandbox_id - (map_root ? 1 : 0);
+          if (size_first_interval > 1)
+            line2 = xasprintf ("%d %d %d%s", map_root ? 1 : 0, from_id, size_first_interval, sep);
+          if (len_id_range - size_first_interval > 2)
+            line4 = xasprintf ("%d %d %d%s", sandbox_id + 1,
+                               from_id + size_first_interval + 1,
+                               len_id_range - size_first_interval - 1, sep);
+        }
+    }
+  line3 = xasprintf ("%d %d 1%s", sandbox_id, parent_id, sep);
+  return strconcat4 (line1, line2, line3, line4);
+}
+
 static void
 write_uid_gid_map (uid_t sandbox_uid,
                    uid_t parent_uid,
@@ -727,32 +767,32 @@ write_uid_gid_map (uid_t sandbox_uid,
   else
     dir = xasprintf ("%d", pid);
 
+  if (!is_privileged)
+    {
+      cleanup_free char *uidmap_cmd = NULL;
+      cleanup_free char *gidmap_cmd = NULL;
+
+      uid_map = generate_map_file (map_root, sandbox_uid, parent_uid, TRUE, " ");
+      gid_map = generate_map_file (map_root, sandbox_gid, parent_gid, FALSE, " ");
+
+      uidmap_cmd = xasprintf ("newuidmap %d %s", pid, uid_map);
+      if (system (uidmap_cmd))
+        die ("could not set newuidmap");
+
+      gidmap_cmd = xasprintf ("newgidmap %d  %s", pid, gid_map);
+      if (system (gidmap_cmd))
+        die ("could not set newgidmap");
+
+      return;
+    }
+
+  /* From now on it is the privileged case.  */
+
   dir_fd = openat (proc_fd, dir, O_RDONLY | O_PATH);
   if (dir_fd < 0)
     die_with_error ("open /proc/%s failed", dir);
 
-  if (map_root && parent_uid != 0 && sandbox_uid != 0)
-    uid_map = xasprintf ("0 %d 1\n"
-                         "%d %d 1\n", overflow_uid, sandbox_uid, parent_uid);
-  else
-    uid_map = xasprintf ("%d %d 1\n", sandbox_uid, parent_uid);
-
-  if (map_root && parent_gid != 0 && sandbox_gid != 0)
-    gid_map = xasprintf ("0 %d 1\n"
-                         "%d %d 1\n", overflow_gid, sandbox_gid, parent_gid);
-  else
-    gid_map = xasprintf ("%d %d 1\n", sandbox_gid, parent_gid);
-
-  /* We have to be root to be allowed to write to the uid map
-   * for setuid apps, so temporary set fsuid to 0 */
-  if (is_privileged)
-    old_fsuid = setfsuid (0);
-
-  if (write_file_at (dir_fd, "uid_map", uid_map) != 0)
-    die_with_error ("setting up uid map");
-
-  if (deny_groups &&
-      write_file_at (dir_fd, "setgroups", "deny\n") != 0)
+  if (deny_groups && write_file_at (dir_fd, "setgroups", "deny\n") != 0)
     {
       /* If /proc/[pid]/setgroups does not exist, assume we are
        * running a linux kernel < 3.19, i.e. we live with the
@@ -763,15 +803,22 @@ write_uid_gid_map (uid_t sandbox_uid,
         die_with_error ("error writing to setgroups");
     }
 
+  uid_map = generate_map_file (map_root, sandbox_uid, parent_uid, TRUE, "\n");
+  gid_map = generate_map_file (map_root, sandbox_gid, parent_gid, FALSE, "\n");
+
+  /* We have to be root to be allowed to write to the uid map
+   * for setuid apps, so temporary set fsuid to 0 */
+  old_fsuid = setfsuid (0);
+
+  if (write_file_at (dir_fd, "uid_map", uid_map) != 0)
+    die_with_error ("setting up uid map");
+
   if (write_file_at (dir_fd, "gid_map", gid_map) != 0)
     die_with_error ("setting up gid map");
 
-  if (is_privileged)
-    {
-      setfsuid (old_fsuid);
-      if (setfsuid (-1) != real_uid)
-        die ("Unable to re-set fsuid");
-    }
+  setfsuid (old_fsuid);
+  if (setfsuid (-1) != real_uid)
+    die ("Unable to re-set fsuid");
 }
 
 static void
@@ -1810,29 +1857,6 @@ parse_args (int    *argcp,
   parse_args_recurse (argcp, argvp, FALSE, &total_parsed_argc);
 }
 
-static void
-read_overflowids (void)
-{
-  cleanup_free char *uid_data = NULL;
-  cleanup_free char *gid_data = NULL;
-
-  uid_data = load_file_at (AT_FDCWD, "/proc/sys/kernel/overflowuid");
-  if (uid_data == NULL)
-    die_with_error ("Can't read /proc/sys/kernel/overflowuid");
-
-  overflow_uid = strtol (uid_data, NULL, 10);
-  if (overflow_uid == 0)
-    die ("Can't parse /proc/sys/kernel/overflowuid");
-
-  gid_data = load_file_at (AT_FDCWD, "/proc/sys/kernel/overflowgid");
-  if (gid_data == NULL)
-    die_with_error ("Can't read /proc/sys/kernel/overflowgid");
-
-  overflow_gid = strtol (gid_data, NULL, 10);
-  if (overflow_gid == 0)
-    die ("Can't parse /proc/sys/kernel/overflowgid");
-}
-
 int
 main (int    argc,
       char **argv)
@@ -1874,8 +1898,6 @@ main (int    argc,
 
   /* The initial code is run with high permissions
      (i.e. CAP_SYS_ADMIN), so take lots of care. */
-
-  read_overflowids ();
 
   argv0 = argv[0];
 
@@ -2023,22 +2045,11 @@ main (int    argc,
 
   if (pid != 0)
     {
-      /* Parent, outside sandbox, privileged (initially) */
+      /* Parent, outside sandbox */
 
-      if (is_privileged && opt_unshare_user)
-        {
-          /* We're running as euid 0, but the uid we want to map is
-           * not 0. This means we're not allowed to write this from
-           * the child user namespace, so we do it from the parent.
-           *
-           * Also, we map uid/gid 0 in the namespace (to overflowuid)
-           * if opt_needs_devpts is true, because otherwise the mount
-           * of devpts fails due to root not being mapped.
-           */
-          write_uid_gid_map (ns_uid, real_uid,
-                             ns_gid, real_gid,
-                             pid, TRUE, opt_needs_devpts);
-        }
+      write_uid_gid_map (ns_uid, real_uid,
+                         ns_gid, real_gid,
+                         pid, TRUE, opt_needs_devpts);
 
       /* Initial launched process, wait for exec:ed command to exit */
 
@@ -2096,28 +2107,6 @@ main (int    argc,
 
   if (opt_unshare_net)
     loopback_setup (); /* Will exit if unsuccessful */
-
-  ns_uid = opt_sandbox_uid;
-  ns_gid = opt_sandbox_gid;
-  if (!is_privileged && opt_unshare_user)
-    {
-      /* In the unprivileged case we have to write the uid/gid maps in
-       * the child, because we have no caps in the parent */
-
-      if (opt_needs_devpts)
-        {
-          /* This is a bit hacky, but we need to first map the real uid/gid to
-             0, otherwise we can't mount the devpts filesystem because root is
-             not mapped. Later we will create another child user namespace and
-             map back to the real uid */
-          ns_uid = 0;
-          ns_gid = 0;
-        }
-
-      write_uid_gid_map (ns_uid, real_uid,
-                         ns_gid, real_gid,
-                         -1, TRUE, FALSE);
-    }
 
   old_umask = umask (0);
 
@@ -2214,21 +2203,6 @@ main (int    argc,
 
   if (umount2 ("oldroot", MNT_DETACH))
     die_with_error ("unmount old root");
-
-  if (opt_unshare_user &&
-      (ns_uid != opt_sandbox_uid || ns_gid != opt_sandbox_gid))
-    {
-      /* Now that devpts is mounted and we've no need for mount
-         permissions we can create a new userspace and map our uid
-         1:1 */
-
-      if (unshare (CLONE_NEWUSER))
-        die_with_error ("unshare user ns");
-
-      write_uid_gid_map (opt_sandbox_uid, ns_uid,
-                         opt_sandbox_gid, ns_gid,
-                         -1, FALSE, FALSE);
-    }
 
   /* Now make /newroot the real root */
   if (chdir ("/newroot") != 0)
