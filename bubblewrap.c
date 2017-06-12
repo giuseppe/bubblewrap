@@ -1812,7 +1812,7 @@ main (int    argc,
   acquire_privs ();
 
   /* Never gain any more privs during exec */
-  if (prctl (PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
+  if (is_privileged && prctl (PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
     die_with_error ("prctl(PR_SET_NO_NEW_CAPS) failed");
 
   /* The initial code is run with high permissions
@@ -1989,6 +1989,9 @@ main (int    argc,
                              pid, TRUE, opt_needs_devpts);
         }
 
+      if (!is_privileged && prctl (PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
+        die_with_error ("prctl(PR_SET_NO_NEW_CAPS) failed");
+
       /* Initial launched process, wait for exec:ed command to exit */
 
       /* We don't need any privileges in the launcher, drop them immediately. */
@@ -2015,6 +2018,9 @@ main (int    argc,
       monitor_child (event_fd, pid);
       exit (0); /* Should not be reached, but better safe... */
     }
+
+  if (!is_privileged && prctl (PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
+    die_with_error ("prctl(PR_SET_NO_NEW_CAPS) failed");
 
   /* Child, in sandbox, privileged in the parent or in the user namespace (if --unshare-user).
    *
